@@ -1,0 +1,901 @@
+package com.alan.clients.module.impl.movement.noslow;
+
+import com.alan.clients.module.impl.movement.NoSlow;
+import com.alan.clients.newevent.Listener;
+import com.alan.clients.newevent.annotations.EventLink;
+import com.alan.clients.newevent.impl.motion.PostMotionEvent;
+import com.alan.clients.newevent.impl.motion.PreMotionEvent;
+import com.alan.clients.newevent.impl.motion.PreUpdateEvent;
+import com.alan.clients.newevent.impl.motion.SlowDownEvent;
+import com.alan.clients.newevent.impl.motion.SprintEvent;
+import com.alan.clients.newevent.impl.other.WorldChangeEvent;
+import com.alan.clients.newevent.impl.packet.PacketReceiveEvent;
+import com.alan.clients.newevent.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.NumberValue;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemBow;
+import net.minecraft.item.ItemFood;
+import net.minecraft.item.ItemPotion;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.ItemSword;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.l;
+import net.minecraft.network.play.client.m;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+public class Grim2374NoSlow extends Mode<NoSlow> {
+    private final NumberValue slowInterval = new NumberValue("Slow Interval", this, 0, 0, 5, 1);
+    private final BooleanValue boost = new BooleanValue("Boost", this, true);
+    private final BooleanValue slotResync = new BooleanValue("Slot Resync", this, false);
+    private final NumberValue c09Interval = new NumberValue("C09 Interval", this, 2, 2, 40, 1,
+        () -> !this.slotResync.wo());
+    private final BooleanValue slotRelease = new BooleanValue("C08+C07", this, false,
+        () -> !this.slotResync.wo());
+    private final BooleanValue backFullTick = new BooleanValue("BACK Full Tick", this, false,
+        () -> !this.slotResync.wo() || this.slotRelease.wo());
+
+    private boolean backFullActive() {
+        return this.slotResync.wo() && !this.slotRelease.wo() && this.backFullTick.wo();
+    }
+    private final BooleanValue blink = new BooleanValue("Blink", this, false);
+    private final NumberValue blinkTicks = new NumberValue("Blink Ticks", this, 3, 1, 8, 1,
+        () -> !this.blink.wo());
+    private final BooleanValue blinkBlock = new BooleanValue("Blink Block", this, false,
+        () -> !this.blink.wo() || !this.slotResync.wo() || this.slotRelease.wo());
+
+    private boolean blinkBlockActive() {
+        return this.blink.wo() && this.slotResync.wo() && !this.slotRelease.wo() && this.blinkBlock.wo();
+    }
+
+    private boolean sandwichMode() {
+        return this.blink.wo() && !this.slotResync.wo();
+    }
+
+    public boolean isAttackWindowReady() {
+        if (!this.activeAtPreUpdate) {
+            return false;
+        }
+        if (this.blinkActive) {
+            return true;
+        }
+        if (this.sandwichMode()) {
+            return this.swPhase == SwPhase.AWAY;
+        }
+        if (this.slotResync.wo() && this.resyncRunning) {
+            return this.windowDirty
+                || this.resyncPhase == ResyncPhase.AWAY && !this.slotRelease.wo();
+        }
+        return true;
+    }
+    private final BooleanValue timerBurst = new BooleanValue("Timer Burst", this, false);
+    private final NumberValue burstTicks = new NumberValue("Burst Ticks", this, 8, 4, 20, 1, () -> !this.timerBurst.wo());
+    private final NumberValue maxTimer = new NumberValue("Max Timer", this, 1.5, 1.05, 2.0, 0.05, () -> !this.timerBurst.wo());
+    private final NumberValue safetyMs = new NumberValue("Safety", this, 30, 10, 60, 5, () -> !this.timerBurst.wo());
+
+    private static final double BOOST = 9.0E-4D;
+    private static final double TICK_MS = 50.0D;
+    private static final double RESERVE_MS = 8.0D;
+    private static final float MIN_PAYBACK = 0.25F;
+
+    private int tick;
+    private boolean fullTick = true;
+    private boolean activeAtPreUpdate;
+    private volatile int kbBoostLockout;
+
+    private enum ResyncPhase { NONE, AWAY, BACK }
+    private ResyncPhase resyncPhase = ResyncPhase.NONE;
+    private int grimSlotGuess;
+    private boolean resyncRunning;
+    private boolean windowDirty;
+    private boolean resyncSending;
+    private int cyclePos;
+    private int gapTick;
+    private boolean selfC07;
+    private boolean selfC08;
+
+    private final Object blinkLock = new Object();
+    private volatile boolean blinkActive;
+    private boolean blinkDoneThisCycle;
+    private long blinkStartNano;
+    private int blinkHeldFlying;
+    private volatile boolean blinkAbort;
+    private volatile boolean blinkKb;
+    private volatile boolean blinkReleased;
+    private final List<Packet<?>> blinkQueue = new ArrayList<>();
+
+    private enum SwPhase { NONE, HOLD, AWAY }
+    private SwPhase swPhase = SwPhase.NONE;
+    private boolean swArm;
+    private volatile boolean swAbortStop;
+    private boolean swFinishing;
+
+    private double creditMs;
+    private long lastRealNano;
+    private boolean floorPending;
+    private boolean bursting;
+    private int burstLeft;
+    private float tUp = 1.0F;
+    private float tDown = 1.0F;
+    private boolean timerOverridden;
+
+    @EventLink(value = 5)
+    public final Listener<PreUpdateEvent> onPreUpdate = var1x -> {
+        if (this.kbBoostLockout > 0) {
+            this.kbBoostLockout--;
+        }
+        this.activeAtPreUpdate = this.active();
+        if (!this.active()) {
+            if (this.sandwichMode()) {
+                if (this.blinkActive || this.blinkHeldFlying > 0) {
+                    this.swAbortStop = true;
+                    this.swFinishing = true;
+                    this.sandwichFlushIfDue(true);
+                    if (this.blinkActive) {
+                        this.swPhase = SwPhase.HOLD;
+                        this.fullTick = true;
+                        if (this.sprintConditions(aEg.thePlayer.moveForward)) {
+                            aEg.thePlayer.setSprinting(true);
+                        }
+                        this.resetTimerState();
+                        return;
+                    }
+                    this.fullTick = true;
+                    this.resetTimerState();
+                    return;
+                }
+                this.swFinishing = false;
+                this.resetSandwichState();
+                this.tick = 0;
+                this.fullTick = true;
+                this.resetTimerState();
+                return;
+            }
+            this.tick = 0;
+            this.fullTick = true;
+            this.flushBlink();
+            this.resyncStop();
+            this.resetTimerState();
+            return;
+        }
+
+        if (this.sandwichMode()
+            && aEg.thePlayer.getHeldItem().getItem() instanceof ItemSword) {
+            this.swArm = false;
+            boolean wasHolding = this.blinkActive;
+            if (wasHolding) {
+                this.sandwichFlushIfDue(false);
+            }
+
+            if (this.blinkActive) {
+                this.swPhase = SwPhase.HOLD;
+                this.fullTick = true;
+            } else {
+                boolean cont = this.blinkAbort || this.blinkKb;
+                boolean stop = this.swAbortStop;
+                this.blinkAbort = false;
+                this.blinkKb = false;
+                this.swAbortStop = false;
+                if (cont || stop) {
+                    this.swPhase = stop ? SwPhase.NONE : SwPhase.AWAY;
+                    this.fullTick = true;
+                } else if (this.swPhase == SwPhase.NONE) {
+                    this.swPhase = SwPhase.HOLD;
+                    this.fullTick = false;
+                    this.swArm = true;
+                } else if (this.swPhase == SwPhase.AWAY) {
+                    ItemStack held = aEg.thePlayer.getHeldItem();
+                    if (held != null) {
+                        PacketUtil.send(new C08PacketPlayerBlockPlacement(held));
+                    }
+                    this.swPhase = SwPhase.HOLD;
+                    this.fullTick = false;
+                    this.swArm = true;
+                } else if (wasHolding) {
+                    this.swPhase = SwPhase.AWAY;
+                    this.fullTick = true;
+                } else {
+                    this.fullTick = true;
+                }
+            }
+
+            if (this.sprintConditions(aEg.thePlayer.moveForward)) {
+                aEg.thePlayer.setSprinting(true);
+            }
+            this.resetTimerState();
+            return;
+        }
+
+        if (this.slotResync.wo() && aEg.thePlayer.getHeldItem().getItem() instanceof ItemSword) {
+            boolean sealedAway = false;
+            if (this.blinkActive) {
+                sealedAway = this.blinkTick();
+            }
+            if (this.blinkActive) {
+                this.fullTick = true;
+            } else if (sealedAway) {
+                this.fullTick = true;
+            } else {
+                this.resyncTick();
+            }
+        } else {
+            if (this.sandwichMode()) {
+                this.swAbortStop = true;
+                this.sandwichFlushIfDue(true);
+                if (!this.blinkActive) {
+                    this.resetSandwichState();
+                }
+            } else {
+                this.flushBlink();
+                if (this.resyncPhase != ResyncPhase.NONE) {
+                    this.resyncStop();
+                }
+            }
+            int interval = this.slowInterval.wo().intValue();
+            this.fullTick = interval <= 0 || this.tick % (interval + 1) == 0;
+            this.tick++;
+        }
+
+        if (this.sprintConditions(aEg.thePlayer.moveForward)) {
+            aEg.thePlayer.setSprinting(true);
+        }
+
+        this.timerTick();
+    };
+
+    private void resyncTick() {
+        int local = aEg.thePlayer.inventory.currentItem;
+
+        if (this.resyncPhase == ResyncPhase.NONE) {
+            this.grimSlotGuess = local;
+            this.resyncRunning = true;
+            this.fullTick = false;
+            this.resyncPhase = ResyncPhase.BACK;
+            return;
+        }
+
+        if (this.windowDirty) {
+            if (this.cyclePos <= 1) {
+                this.fullTick = this.resyncPhase == ResyncPhase.AWAY;
+            } else if (this.backFullActive()) {
+                this.fullTick = false;
+            }
+            return;
+        }
+
+        if (this.cyclePos == 0) {
+            if (this.slotRelease.wo()) {
+                this.sendReleaseC07();
+            } else {
+                int target = (local + 1) % 9;
+                if (target == this.grimSlotGuess) {
+                    target = (local + 2) % 9;
+                }
+                this.sendC09(target);
+            }
+            this.resyncPhase = ResyncPhase.AWAY;
+            this.fullTick = true;
+            this.cyclePos = 1;
+            return;
+        }
+
+        if (this.cyclePos == 1) {
+            if (!this.slotRelease.wo() && this.grimSlotGuess != local) {
+                this.sendC09(local);
+            }
+            ItemStack held = aEg.thePlayer.getHeldItem();
+            if (held != null) {
+                this.sendC08(held);
+            }
+            this.resyncPhase = ResyncPhase.BACK;
+            this.fullTick = this.backFullActive() || this.blinkBlockActive();
+            this.blinkDoneThisCycle = false;
+            this.gapTick = 0;
+            this.cyclePos = (!this.blink.wo() || this.c09Interval.wo().intValue() <= 2) ? 0 : 2;
+            return;
+        }
+
+        int interval = this.slowInterval.wo().intValue();
+        this.fullTick = this.backFullActive()
+            ? this.gapTick % 2 == 1
+            : interval <= 0 || this.gapTick % (interval + 1) == 0;
+        this.gapTick++;
+        this.cyclePos++;
+        if (this.cyclePos >= Math.max(2, this.c09Interval.wo().intValue())) {
+            this.cyclePos = 0;
+            this.gapTick = 0;
+        }
+    }
+
+    private void sendC09(int slot) {
+        this.resyncSending = true;
+        try {
+            PacketUtil.send(new l(slot));
+        } finally {
+            this.resyncSending = false;
+        }
+        this.grimSlotGuess = slot;
+    }
+
+    private void sendReleaseC07() {
+        this.selfC07 = true;
+        try {
+            PacketUtil.send(new C07PacketPlayerDigging(
+                C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+        } finally {
+            this.selfC07 = false;
+        }
+    }
+
+    private void sendC08(ItemStack held) {
+        this.selfC08 = true;
+        try {
+            PacketUtil.send(new C08PacketPlayerBlockPlacement(held));
+        } finally {
+            this.selfC08 = false;
+        }
+    }
+
+    private void resyncStop() {
+        boolean needCutBack = this.resyncRunning
+            && this.resyncPhase == ResyncPhase.AWAY
+            && this.grimSlotGuess != aEg.thePlayer.inventory.currentItem
+            && !this.windowDirty;
+        this.resyncPhase = ResyncPhase.NONE;
+        this.resyncRunning = false;
+        this.cyclePos = 0;
+        this.gapTick = 0;
+        if (needCutBack) {
+            this.sendC09(aEg.thePlayer.inventory.currentItem);
+        }
+    }
+
+    private void resetResyncState() {
+        this.resyncPhase = ResyncPhase.NONE;
+        this.resyncRunning = false;
+        this.windowDirty = false;
+        this.resyncSending = false;
+        this.selfC07 = false;
+        this.selfC08 = false;
+        this.cyclePos = 0;
+        this.gapTick = 0;
+        this.grimSlotGuess = 0;
+        this.blinkDoneThisCycle = false;
+    }
+
+    private boolean blinkTick() {
+        if (!this.blinkActive) {
+            return false;
+        }
+        int want = Math.max(1, this.blinkTicks.wo().intValue());
+        double heldMs = (System.nanoTime() - this.blinkStartNano) / 1.0E6D;
+        boolean timeBudgetOk = heldMs + (double) this.pingMs() >= this.blinkHeldFlying * TICK_MS;
+        boolean abort = this.blinkAbort || this.blinkKb || this.blinkReleased;
+        if (abort || (this.blinkHeldFlying >= want && timeBudgetOk)) {
+            if (!abort && this.blinkBlockActive()) {
+                this.flushBlinkBlockSeal();
+                return true;
+            }
+            this.flushBlink();
+        }
+        return false;
+    }
+
+    private void tryStartBlink() {
+        ResyncPhase wantPhase = this.blinkBlockActive() ? ResyncPhase.BACK : ResyncPhase.AWAY;
+        if (!this.blink.wo()
+            || !this.slotResync.wo()
+            || !this.active()
+            || !(aEg.thePlayer.getHeldItem().getItem() instanceof ItemSword)
+            || this.blinkActive
+            || this.blinkDoneThisCycle
+            || this.windowDirty
+            || this.resyncPhase != wantPhase
+            || !this.resyncRunning) {
+            return;
+        }
+        synchronized (this.blinkLock) {
+            this.blinkQueue.clear();
+            this.blinkHeldFlying = 0;
+            this.blinkAbort = false;
+            this.blinkKb = false;
+            this.blinkReleased = false;
+            this.blinkStartNano = System.nanoTime();
+            this.blinkActive = true;
+        }
+        this.blinkDoneThisCycle = true;
+    }
+
+    private void flushBlink() {
+        boolean blockMode = this.blinkBlockActive();
+        boolean alreadyReleased = this.blinkReleased;
+        List<Packet<?>> out;
+        synchronized (this.blinkLock) {
+            if (!this.blinkActive) {
+                return;
+            }
+            this.blinkActive = false;
+            out = new ArrayList<>(this.blinkQueue);
+            this.blinkQueue.clear();
+            this.blinkHeldFlying = 0;
+            this.blinkAbort = false;
+            this.blinkKb = false;
+            this.blinkReleased = false;
+            this.blinkStartNano = 0L;
+        }
+        this.dispatchFlush(out, blockMode, alreadyReleased);
+    }
+
+    private void flushBlinkBlockSeal() {
+        List<Packet<?>> out;
+        synchronized (this.blinkLock) {
+            if (!this.blinkActive) {
+                return;
+            }
+            this.blinkActive = false;
+            out = new ArrayList<>(this.blinkQueue);
+            this.blinkQueue.clear();
+            this.blinkHeldFlying = 0;
+            this.blinkAbort = false;
+            this.blinkKb = false;
+            this.blinkReleased = false;
+            this.blinkStartNano = 0L;
+        }
+
+        int local = aEg.thePlayer.inventory.currentItem;
+        int target = (local + 1) % 9;
+        if (target == this.grimSlotGuess) {
+            target = (local + 2) % 9;
+        }
+        this.sendC09(target);
+
+        int firstFlying = -1;
+        for (int i = 0; i < out.size(); i++) {
+            if (out.get(i) instanceof C03PacketPlayer) {
+                firstFlying = i;
+                break;
+            }
+        }
+        if (firstFlying >= 0) {
+            PacketUtil.sendNoEvent(out.remove(firstFlying));
+        }
+
+        for (Packet<?> packet : out) {
+            PacketUtil.sendNoEvent(packet);
+        }
+
+        this.resyncPhase = ResyncPhase.AWAY;
+        this.cyclePos = 1;
+        this.gapTick = 0;
+        this.fullTick = true;
+    }
+
+    private void sandwichFlushIfDue(boolean urgent) {
+        if (!this.blinkActive) {
+            return;
+        }
+        int want = Math.max(1, this.blinkTicks.wo().intValue());
+        double heldMs = (System.nanoTime() - this.blinkStartNano) / 1.0E6D;
+        boolean timeOk = heldMs >= this.blinkHeldFlying * 50.0D - 8.0D;
+        boolean due = urgent || this.blinkAbort || this.blinkKb || this.swAbortStop;
+        if ((!due && this.blinkHeldFlying < want) || !timeOk) {
+            return;
+        }
+
+        List<Packet<?>> out;
+        synchronized (this.blinkLock) {
+            this.blinkActive = false;
+            out = new ArrayList<>(this.blinkQueue);
+            this.blinkQueue.clear();
+            this.blinkHeldFlying = 0;
+            this.blinkStartNano = 0L;
+        }
+        this.dispatchFlush(out, true, false);
+    }
+
+    private void dispatchFlush(List<Packet<?>> out, boolean sendC07, boolean skipHeadIfReleased) {
+        if (sendC07) {
+            if (!skipHeadIfReleased) {
+                PacketUtil.sendNoEvent(new C07PacketPlayerDigging(
+                    C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+            }
+            int firstFlying = -1;
+            for (int i = 0; i < out.size(); i++) {
+                if (out.get(i) instanceof C03PacketPlayer) {
+                    firstFlying = i;
+                    break;
+                }
+            }
+            if (firstFlying >= 0) {
+                PacketUtil.sendNoEvent(out.remove(firstFlying));
+            }
+        }
+        for (Packet<?> packet : out) {
+            PacketUtil.sendNoEvent(packet);
+        }
+    }
+
+    private void resetSandwichState() {
+        this.swPhase = SwPhase.NONE;
+        this.swArm = false;
+        this.swAbortStop = false;
+        this.swFinishing = false;
+    }
+
+    private void discardBlink() {
+        synchronized (this.blinkLock) {
+            this.blinkActive = false;
+            this.blinkQueue.clear();
+            this.blinkHeldFlying = 0;
+            this.blinkAbort = false;
+            this.blinkKb = false;
+            this.blinkReleased = false;
+            this.blinkStartNano = 0L;
+            this.blinkDoneThisCycle = false;
+            this.kbBoostLockout = 0;
+        }
+        this.resetSandwichState();
+    }
+
+    private boolean isBlinkHeld(Object packet) {
+        return packet instanceof C03PacketPlayer
+            || packet instanceof C0FPacketConfirmTransaction
+            || packet instanceof C0BPacketEntityAction
+            || packet instanceof C02PacketUseEntity
+            || packet instanceof m;
+    }
+
+    @EventLink
+    public final Listener<SprintEvent> onSprint = var1x -> {
+        if (this.sprintConditions(aEg.thePlayer.movementInput.moveForward)) {
+            aEg.thePlayer.setSprinting(true);
+        }
+    };
+
+    private boolean sprintConditions(float forward) {
+        return (this.active() || this.swFinishing)
+            && forward > 0.0F
+            && (aEg.thePlayer.getFoodStats().getFoodLevel() > 6 || aEg.thePlayer.capabilities.allowFlying)
+            && !aEg.thePlayer.isSneaking()
+            && !aEg.gameSettings.keyBindSneak.isKeyDown()
+            && !aEg.thePlayer.isPotionActive(net.minecraft.potion.Potion.blindness)
+            && !aEg.thePlayer.isCollidedHorizontally
+            && !aEg.thePlayer.isInWater()
+            && !aEg.thePlayer.isInLava();
+    }
+
+    @EventLink
+    public final Listener<PostMotionEvent> onPostMotion = var1x -> {
+        if (this.sandwichMode()) {
+            if (this.swFinishing && !this.blinkActive) {
+                this.swFinishing = false;
+            }
+            if (this.swArm && this.active()) {
+                synchronized (this.blinkLock) {
+                    this.blinkQueue.clear();
+                    this.blinkHeldFlying = 0;
+                    this.blinkAbort = false;
+                    this.blinkKb = false;
+                    this.swAbortStop = false;
+                    this.blinkStartNano = System.nanoTime();
+                    this.blinkActive = true;
+                }
+            }
+            return;
+        }
+        if (!this.blinkActive) {
+            this.tryStartBlink();
+        }
+    };
+
+    @EventLink
+    public final Listener<PreMotionEvent> onPreMotion = var1x -> {
+        if (this.boost.wo()
+            && this.kbBoostLockout <= 0
+            && (this.active() || this.swFinishing)
+            && (this.sandwichMode() || !this.blinkActive)
+            && this.fullTick
+            && !aEg.thePlayer.isCollidedHorizontally) {
+            double dX = aEg.thePlayer.posX - aEg.thePlayer.prevPosX;
+            double dZ = aEg.thePlayer.posZ - aEg.thePlayer.prevPosZ;
+            double dist = Math.sqrt(dX * dX + dZ * dZ);
+            if (dist > 1.0E-4D) {
+                double scale = BOOST / dist;
+                double addX = dX * scale;
+                double addZ = dZ * scale;
+                aEg.thePlayer.posX += addX;
+                aEg.thePlayer.posZ += addZ;
+                var1x.setPosX(var1x.getPosX() + addX);
+                var1x.setPosZ(var1x.getPosZ() + addZ);
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener<SlowDownEvent> onSlowDown = var1x -> {
+        if (this.fullTick && (this.activeAtPreUpdate || this.swFinishing)) {
+            var1x.setCancelled();
+        }
+    };
+
+    @EventLink
+    public final Listener<PacketSendEvent> onPacketSend = var1x -> {
+        if (var1x.isCancelled()) {
+            return;
+        }
+
+        Object packet = var1x.dq();
+
+        if (this.blinkActive) {
+            if (this.sandwichMode()) {
+                if (this.isBlinkHeld(packet)
+                    || (packet instanceof C07PacketPlayerDigging c07dig
+                        && c07dig.getStatus() != C07PacketPlayerDigging.Action.RELEASE_USE_ITEM)) {
+                    synchronized (this.blinkLock) {
+                        if (this.blinkActive) {
+                            this.blinkQueue.add((Packet<?>) packet);
+                            if (packet instanceof C03PacketPlayer) {
+                                this.blinkHeldFlying++;
+                            }
+                            var1x.setCancelled(true);
+                            return;
+                        }
+                    }
+                } else if (packet instanceof C07PacketPlayerDigging c07rel
+                    && c07rel.getStatus() == C07PacketPlayerDigging.Action.RELEASE_USE_ITEM) {
+                    var1x.setCancelled();
+                    this.swAbortStop = true;
+                    return;
+                } else if (packet instanceof C08PacketPlayerBlockPlacement) {
+                    var1x.setCancelled();
+                    return;
+                } else if (packet instanceof l) {
+                    this.blinkAbort = true;
+                }
+            } else if (this.isBlinkHeld(packet)) {
+                synchronized (this.blinkLock) {
+                    if (this.blinkActive) {
+                        this.blinkQueue.add((Packet<?>) packet);
+                        if (packet instanceof C03PacketPlayer) {
+                            this.blinkHeldFlying++;
+                        }
+                        var1x.setCancelled(true);
+                        return;
+                    }
+                }
+            }
+            if (!this.sandwichMode()
+                && ((packet instanceof l && !this.resyncSending)
+                    || (packet instanceof C08PacketPlayerBlockPlacement && !this.selfC08))) {
+                this.blinkAbort = true;
+            }
+        }
+
+        if (packet instanceof C03PacketPlayer) {
+            this.creditMs -= TICK_MS;
+            this.windowDirty = false;
+            return;
+        }
+
+        if (!this.resyncRunning && this.resyncPhase == ResyncPhase.NONE) {
+            return;
+        }
+
+        if (packet instanceof C02PacketUseEntity c02
+            && c02.getAction() == C02PacketUseEntity.Action.ATTACK) {
+            this.windowDirty = true;
+        } else if (packet instanceof l c09) {
+            if (!this.resyncSending) {
+                this.windowDirty = true;
+                this.grimSlotGuess = c09.getSlotId();
+            }
+        } else if (packet instanceof C08PacketPlayerBlockPlacement && !this.selfC08) {
+            this.windowDirty = true;
+        } else if (packet instanceof C07PacketPlayerDigging c07) {
+            if (c07.getStatus() == C07PacketPlayerDigging.Action.RELEASE_USE_ITEM) {
+                if (this.selfC07) {
+                    return;
+                }
+                this.blinkAbort = true;
+                this.blinkReleased = true;
+                this.resyncStop();
+            } else if (this.slotResync.wo() && this.slotRelease.wo()) {
+                this.windowDirty = true;
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener<PacketReceiveEvent> onPacketReceive = var1x -> {
+        if (var1x.isCancelled()) {
+            return;
+        }
+        Object p = var1x.getPacket();
+        if (p instanceof S32PacketConfirmTransaction) {
+            this.floorPending = true;
+            return;
+        }
+        if ((p instanceof S12PacketEntityVelocity s12 && s12.getEntityID() == aEg.thePlayer.getEntityId())
+            || p instanceof S27PacketExplosion) {
+            if (this.active() || this.blinkActive) {
+                this.kbBoostLockout = 10;
+            }
+            if (this.blinkActive) {
+                this.blinkKb = true;
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener<WorldChangeEvent> onWorldChange = var1x -> {
+        this.discardBlink();
+        this.resetTimerState();
+        this.resetResyncState();
+    };
+
+    private void timerTick() {
+        if (!this.timerBurst.wo()
+            || this.blinkActive
+            || this.blink.wo()) {
+            this.bursting = false;
+            this.burstLeft = 0;
+            this.restoreTimer();
+            return;
+        }
+
+        long now = System.nanoTime();
+        if (this.lastRealNano == 0L) {
+            this.lastRealNano = now;
+        }
+        this.creditMs += (now - this.lastRealNano) / 1.0E6D;
+        this.lastRealNano = now;
+
+        double cap = this.capMs();
+        if (this.floorPending) {
+            this.floorPending = false;
+            this.creditMs = Math.min(this.creditMs, cap);
+        }
+
+        if (!MoveUtil.isMoving()) {
+            this.bursting = false;
+            this.burstLeft = 0;
+            this.applyTimer(1.0F);
+            return;
+        }
+
+        if (this.bursting) {
+            if (this.burstLeft > 0 && this.creditMs - TICK_MS >= RESERVE_MS) {
+                this.burstLeft--;
+                this.applyTimer(this.tUp);
+                return;
+            }
+            this.bursting = false;
+        }
+
+        if (!this.bursting) {
+            if (this.creditMs >= cap - RESERVE_MS) {
+                this.snapshotProfile();
+                this.burstLeft = Math.max(1, this.burstTicks.wo().intValue());
+                this.bursting = true;
+                if (this.creditMs - TICK_MS >= RESERVE_MS) {
+                    this.burstLeft--;
+                    this.applyTimer(this.tUp);
+                    return;
+                }
+                this.bursting = false;
+            }
+            if (this.tDown >= 1.0F) {
+                this.snapshotProfile();
+            }
+            this.applyTimer(this.tDown);
+        }
+    }
+
+    private double capMs() {
+        return Math.max(0.0D, this.pingMs() + 120.0D - this.safetyMs.wo().doubleValue());
+    }
+
+    private void snapshotProfile() {
+        int n = Math.max(1, this.burstTicks.wo().intValue());
+        long ping = this.pingMs();
+        double peak = ping < 50 ? 122.0D : ping < 100 ? 100.0D : 82.0D;
+
+        double up = 1.0D / (1.0D - Math.min(peak, TICK_MS * n - 1.0D) / (TICK_MS * n));
+        up = Math.min(this.maxTimer.wo().doubleValue(), up);
+        this.tUp = (float) up;
+
+        double down = up / (2.0D * up - 1.0D);
+        this.tDown = (float) Math.max(MIN_PAYBACK, Math.min(1.0D, down));
+    }
+
+    private long pingMs() {
+        try {
+            if (aEg.getNetHandler() != null
+                && aEg.thePlayer != null
+                && aEg.getNetHandler().getPlayerInfo(aEg.thePlayer.getUniqueID()) != null) {
+                return aEg.getNetHandler().getPlayerInfo(aEg.thePlayer.getUniqueID()).getResponseTime();
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0L;
+    }
+
+    private void applyTimer(float speed) {
+        if (Math.abs(speed - 1.0F) > 1.0E-3F) {
+            aEg.timer.dzD = speed;
+            this.timerOverridden = true;
+        } else if (this.timerOverridden) {
+            aEg.timer.dzD = 1.0F;
+            this.timerOverridden = false;
+        }
+    }
+
+    private void restoreTimer() {
+        if (this.timerOverridden) {
+            aEg.timer.dzD = 1.0F;
+            this.timerOverridden = false;
+        }
+    }
+
+    private void resetTimerState() {
+        this.creditMs = 0.0D;
+        this.lastRealNano = 0L;
+        this.floorPending = false;
+        this.bursting = false;
+        this.burstLeft = 0;
+        this.tUp = 1.0F;
+        this.tDown = 1.0F;
+        this.restoreTimer();
+    }
+
+    public Grim2374NoSlow(String var1, NoSlow noSlow) {
+        super(var1, noSlow);
+    }
+
+    @Override
+    public void onDisable() {
+        super.onDisable();
+        this.tick = 0;
+        this.activeAtPreUpdate = false;
+        this.kbBoostLockout = 0;
+        if (this.sandwichMode()) {
+            this.discardBlink();
+        } else {
+            this.flushBlink();
+            this.resyncStop();
+        }
+        this.resetTimerState();
+    }
+
+    private boolean active() {
+        if (aEg.thePlayer == null || aEg.theWorld == null) {
+            return false;
+        }
+
+        if (!aEg.thePlayer.isUsingItem() || aEg.thePlayer.getHeldItem() == null) {
+            return false;
+        }
+
+        NoSlow parent = this.getParent();
+        Item item = aEg.thePlayer.getHeldItem().getItem();
+        return parent.sword.wo() && item instanceof ItemSword
+            || parent.food.wo() && item instanceof ItemFood
+            || parent.potion.wo() && item instanceof ItemPotion
+            || parent.bow.wo() && item instanceof ItemBow;
+    }
+}
